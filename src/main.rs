@@ -68,9 +68,14 @@ fn persisted_device(trees: &[dtb::DeviceTree]) -> Option<usize> {
     trees.iter().position(|tree| tree.name == name)
 }
 
-fn choose_device(trees: &[dtb::DeviceTree], cancellable: bool) -> Result<Option<usize>> {
+fn choose_device(
+    trees: &[dtb::DeviceTree],
+    current: Option<usize>,
+    cancellable: bool,
+) -> Result<Option<usize>> {
     let models: Vec<_> = trees.iter().map(|tree| tree.model.as_str()).collect();
-    let Some(selected) = ui::device_menu(&models, cancellable) else {
+    let current = current.map(|index| trees[index].model.as_str());
+    let Some(selected) = ui::device_menu(&models, current, cancellable) else {
         return Ok(None);
     };
     dtb::install(&trees[selected])?;
@@ -102,7 +107,7 @@ fn run() -> Result {
         device = dtb::detected(&trees);
     }
     while device.is_none() {
-        device = choose_device(&trees, false)?;
+        device = choose_device(&trees, device, false)?;
     }
     let mut timed = true;
     loop {
@@ -126,7 +131,7 @@ fn run() -> Result {
                 break;
             }
             Choice::Device => {
-                if let Some(selected) = choose_device(&trees, true)? {
+                if let Some(selected) = choose_device(&trees, device, true)? {
                     device = Some(selected);
                 }
                 timed = false;
