@@ -341,19 +341,20 @@ pub fn menu(
     device: Option<&str>,
     timed: bool,
 ) -> Choice {
+    let device_detail = device.map(|device| alloc::format!("Current: {device}"));
     let mut items = vec![Item {
         label: "ArmadaOS",
         detail: version,
     }];
     if let Some(version) = rollback {
         items.push(Item {
-            label: "Previous Version",
+            label: "Rollback Version",
             detail: Some(version),
         });
     }
     items.push(Item {
         label: "Device Override",
-        detail: device,
+        detail: device_detail.as_deref(),
     });
     match choose(&items, timed) {
         0 => Choice::Armada,
