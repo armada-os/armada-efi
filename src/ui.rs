@@ -219,11 +219,15 @@ fn draw_graphics(page: Page, items: &[Item], selected: usize, countdown: Option<
     });
 
     let logo = Bmp::<Rgb888>::from_slice(LOGO).ok()?;
-    let logo_x = center - logo.size().width as i32 / 2;
-    let logo_y = size.height as i32 / 18;
-    Image::new(&logo, Point::new(logo_x, logo_y))
-        .draw(&mut canvas)
-        .ok()?;
+    let split = size.width > size.height;
+    let content_top = 40;
+    let content_bottom = size.height as i32 - 130;
+    let brand_height = if page.device.is_some() { 400 } else { 350 };
+    let logo_y = if split {
+        content_top + (content_bottom - content_top - brand_height) / 2
+    } else {
+        size.height as i32 / 18
+    };
 
     let item = FontRenderer::new::<fonts::u8g2_font_fub30_tr>();
     let hint = FontRenderer::new::<fonts::u8g2_font_fur17_tr>();
@@ -231,10 +235,24 @@ fn draw_graphics(page: Page, items: &[Item], selected: usize, countdown: Option<
     let title = FontRenderer::new::<fonts::u8g2_font_fub35_tr>();
 
     let title_y = logo_y + logo.size().height as i32 + 65;
+    let row_height = if items.iter().any(|item| item.detail.is_some()) {
+        116
+    } else {
+        80
+    };
+    let standard_y = title_y + 93;
+    let brand_center = if split { center / 2 } else { center };
+    let menu_center = if split { center + center / 2 } else { center };
+
+    let logo_x = brand_center - logo.size().width as i32 / 2;
+    Image::new(&logo, Point::new(logo_x, logo_y))
+        .draw(&mut canvas)
+        .ok()?;
+
     title
         .render_aligned(
             page.title,
-            Point::new(center, title_y),
+            Point::new(brand_center, title_y),
             VerticalPosition::Center,
             HorizontalAlignment::Center,
             FontColor::Transparent(WHITE),
@@ -242,21 +260,28 @@ fn draw_graphics(page: Page, items: &[Item], selected: usize, countdown: Option<
         )
         .ok()?;
 
-    let row_height = if items.iter().any(|item| item.detail.is_some()) {
-        116
+    let (mut y, rows) = if split {
+        let rows = ((content_bottom - content_top) / row_height).max(1) as usize;
+        let visible = rows.min(items.len()) as i32;
+        (
+            content_top + (content_bottom - content_top - visible * row_height) / 2,
+            rows,
+        )
     } else {
-        80
+        (
+            standard_y,
+            ((size.height as i32 - standard_y - 170) / row_height).max(1) as usize,
+        )
     };
-    let mut y = title_y + 93;
-    let bar = Size::new((size.width * 2 / 3).min(400), row_height as u32);
-    let rows = ((size.height as i32 - y - 170) / row_height).max(1) as usize;
+    let column_width = if split { size.width / 2 } else { size.width };
+    let bar = Size::new((column_width * 2 / 3).min(400), row_height as u32);
     let first = selected
         .saturating_sub(rows / 2)
         .min(items.len().saturating_sub(rows));
     for (index, entry) in items.iter().enumerate().skip(first).take(rows) {
         let color = if index == selected { WHITE } else { MUTED };
         if index == selected {
-            let area = Rectangle::new(Point::new(center - bar.width as i32 / 2, y), bar);
+            let area = Rectangle::new(Point::new(menu_center - bar.width as i32 / 2, y), bar);
             RoundedRectangle::with_equal_corners(area, Size::new(14, 14))
                 .into_styled(PrimitiveStyle::with_fill(SELECTED))
                 .draw(&mut canvas)
@@ -273,7 +298,7 @@ fn draw_graphics(page: Page, items: &[Item], selected: usize, countdown: Option<
                 .ok()?
                 .advance
                 .x;
-            let start = center - (width + 42) / 2;
+            let start = menu_center - (width + 42) / 2;
             let style = PrimitiveStyle::with_stroke(color, 4);
             Line::new(Point::new(start, label_y), Point::new(start + 28, label_y))
                 .into_styled(style)
@@ -304,7 +329,7 @@ fn draw_graphics(page: Page, items: &[Item], selected: usize, countdown: Option<
         } else {
             item.render_aligned(
                 entry.label,
-                Point::new(center, label_y),
+                Point::new(menu_center, label_y),
                 VerticalPosition::Center,
                 HorizontalAlignment::Center,
                 FontColor::Transparent(color),
@@ -315,7 +340,7 @@ fn draw_graphics(page: Page, items: &[Item], selected: usize, countdown: Option<
         if let Some(detail) = entry.detail {
             hint.render_aligned(
                 detail,
-                Point::new(center, y + 88),
+                Point::new(menu_center, y + 88),
                 VerticalPosition::Center,
                 HorizontalAlignment::Center,
                 FontColor::Transparent(MUTED),
@@ -326,18 +351,35 @@ fn draw_graphics(page: Page, items: &[Item], selected: usize, countdown: Option<
         y += row_height;
     }
 
+    let (device_y, version_y) = if split {
+        (title_y + 85, title_y + 118)
+    } else {
+        (size.height as i32 - 232, size.height as i32 - 199)
+    };
     if let Some(device) = page.device {
-        for (label, value, y) in [
-            ("Selected Device: ", device, size.height as i32 - 232),
-            (
-                "EFI Bootloader Version: ",
-                env!("ARMADA_BOOT_VERSION"),
-                size.height as i32 - 199,
-            ),
-        ] {
-            render_pair(&mut canvas, &hint_bold, &hint, center, y, label, value)?;
-        }
+        render_pair(
+            &mut canvas,
+            &hint_bold,
+            &hint,
+            brand_center,
+            device_y,
+            "Selected Device: ",
+            device,
+        )?;
     }
+    render_pair(
+        &mut canvas,
+        &hint_bold,
+        &hint,
+        brand_center,
+        if page.device.is_some() {
+            version_y
+        } else {
+            device_y
+        },
+        "EFI Bootloader Version: ",
+        env!("ARMADA_BOOT_VERSION"),
+    )?;
 
     let countdown = match countdown {
         Some(3) => Some("Booting in 3"),
@@ -348,7 +390,7 @@ fn draw_graphics(page: Page, items: &[Item], selected: usize, countdown: Option<
     if let Some(countdown) = countdown {
         hint.render_aligned(
             countdown,
-            Point::new(center, size.height as i32 - 145),
+            Point::new(brand_center, size.height as i32 - 145),
             VerticalPosition::Center,
             HorizontalAlignment::Center,
             FontColor::Transparent(MUTED),
@@ -401,12 +443,12 @@ fn draw_text(page: Page, items: &[Item], selected: usize, countdown: Option<u8>)
         }
         if let Some(device) = page.device {
             let _ = writeln!(stdout, "\r\nSelected Device: {device}\r");
-            let _ = writeln!(
-                stdout,
-                "Bootloader Version: {}\r",
-                env!("ARMADA_BOOT_VERSION")
-            );
         }
+        let _ = writeln!(
+            stdout,
+            "Bootloader Version: {}\r",
+            env!("ARMADA_BOOT_VERSION")
+        );
         let _ = writeln!(stdout, "\r\nVOL+ / VOL- or Arrows to select\r");
         if page.confirm_hint {
             let _ = writeln!(stdout, "Power or Enter to confirm\r");
@@ -511,7 +553,7 @@ pub fn menu(
     }
 }
 
-pub fn device_menu(models: &[&str], cancellable: bool) -> Option<usize> {
+pub fn device_menu(models: &[&str], current: Option<&str>, cancellable: bool) -> Option<usize> {
     let mut manufacturers = Vec::new();
     for (index, model) in models.iter().enumerate() {
         let manufacturer = model.split_once(' ').map_or(*model, |(name, _)| name);
@@ -531,7 +573,7 @@ pub fn device_menu(models: &[&str], cancellable: bool) -> Option<usize> {
         }
         let page = Page {
             title: "Select Device",
-            device: None,
+            device: current,
             confirm_hint: true,
         };
         let manufacturer = choose(page, &items, false);
