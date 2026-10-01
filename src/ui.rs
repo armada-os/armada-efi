@@ -511,7 +511,7 @@ pub fn menu(
     }
 }
 
-pub fn device_menu(models: &[&str]) -> Option<usize> {
+pub fn device_menu(models: &[&str], cancellable: bool) -> Option<usize> {
     let mut manufacturers = Vec::new();
     for (index, model) in models.iter().enumerate() {
         let manufacturer = model.split_once(' ').map_or(*model, |(name, _)| name);
@@ -526,14 +526,16 @@ pub fn device_menu(models: &[&str]) -> Option<usize> {
             .map(|(name, _)| name.to_ascii_uppercase())
             .collect();
         let mut items: Vec<_> = names.iter().map(|name| Item::new(name)).collect();
-        items.push(Item::back());
+        if cancellable {
+            items.push(Item::back());
+        }
         let page = Page {
             title: "Select Device",
             device: None,
             confirm_hint: true,
         };
         let manufacturer = choose(page, &items, false);
-        if manufacturer == manufacturers.len() {
+        if cancellable && manufacturer == manufacturers.len() {
             return None;
         }
 
