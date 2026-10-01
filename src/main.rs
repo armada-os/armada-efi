@@ -8,7 +8,7 @@ mod dtb;
 mod ui;
 
 use alloc::vec::Vec;
-use core::time::Duration;
+use core::{str, time::Duration};
 use uefi::boot::{self, LoadImageSource, image_handle};
 use uefi::prelude::*;
 use uefi::proto::BootPolicy;
@@ -21,6 +21,8 @@ use ui::Choice;
 
 const DTB_LOADER: &CStr16 = cstr16!(r"\EFI\BOOT\drivers_aa64\adtbloaderaa64.efi");
 const SYSTEMD_BOOT: &CStr16 = cstr16!(r"\EFI\systemd\systemd-bootaa64.efi");
+const ARMADA_DEVICE: &CStr16 = cstr16!("ArmadaDevice");
+const ARMADA: VariableVendor = VariableVendor(guid!("a2ba216f-a695-49fb-aa72-9f57de4ab768"));
 const SYSTEMD: VariableVendor = VariableVendor(guid!("4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"));
 
 fn load(path: &CStr16) -> Result<Handle> {
@@ -60,6 +62,29 @@ fn select(entry: &str) -> Result {
     )
 }
 
+fn persisted_device(trees: &[dtb::DeviceTree]) -> Option<usize> {
+    let (data, _) = runtime::get_variable_boxed(ARMADA_DEVICE, &ARMADA).ok()?;
+    let name = str::from_utf8(&data).ok()?;
+    trees.iter().position(|tree| tree.name == name)
+}
+
+fn choose_device(trees: &[dtb::DeviceTree], cancellable: bool) -> Result<Option<usize>> {
+    let models: Vec<_> = trees.iter().map(|tree| tree.model.as_str()).collect();
+    let Some(selected) = ui::device_menu(&models, cancellable) else {
+        return Ok(None);
+    };
+    dtb::install(&trees[selected])?;
+    runtime::set_variable(
+        ARMADA_DEVICE,
+        &ARMADA,
+        VariableAttributes::NON_VOLATILE
+            | VariableAttributes::BOOTSERVICE_ACCESS
+            | VariableAttributes::RUNTIME_ACCESS,
+        trees[selected].name.as_bytes(),
+    )?;
+    Ok(Some(selected))
+}
+
 fn run() -> Result {
     if let Ok(driver) = load(DTB_LOADER) {
         let _ = boot::start_image(driver);
@@ -67,7 +92,18 @@ fn run() -> Result {
 
     let config = config::load().unwrap_or_default();
     let trees = dtb::available().unwrap_or_default();
-    let mut device = dtb::detected(&trees);
+    if trees.is_empty() {
+        return Err(Status::NOT_FOUND.into());
+    }
+    let mut device = persisted_device(&trees);
+    if let Some(index) = device {
+        dtb::install(&trees[index])?;
+    } else {
+        device = dtb::detected(&trees);
+    }
+    while device.is_none() {
+        device = choose_device(&trees, false)?;
+    }
     let mut timed = true;
     loop {
         let rollback = config.rollback.as_ref().and_then(|rollback| {
@@ -90,9 +126,7 @@ fn run() -> Result {
                 break;
             }
             Choice::Device => {
-                let models: Vec<_> = trees.iter().map(|tree| tree.model.as_str()).collect();
-                if let Some(selected) = ui::device_menu(&models) {
-                    dtb::install(&trees[selected])?;
+                if let Some(selected) = choose_device(&trees, true)? {
                     device = Some(selected);
                 }
                 timed = false;
