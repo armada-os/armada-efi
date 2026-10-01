@@ -1,0 +1,82 @@
+---
+name: Prepare release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version, for example 0.3
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build prerelease
+    runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ inputs.version }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate release
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_NAME" != "$DEFAULT_BRANCH" ]]; then
+            echo "Releases must be prepared from $DEFAULT_BRANCH" >&2
+            exit 1
+          fi
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?([-.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release version: $VERSION" >&2
+            exit 1
+          fi
+          if git show-ref --verify --quiet "refs/tags/$VERSION"; then
+            echo "Tag already exists: $VERSION" >&2
+            exit 1
+          fi
+          git tag "$VERSION" "$GITHUB_SHA"
+
+      - name: Install target
+        run: rustup target add aarch64-unknown-uefi
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --locked --target aarch64-unknown-uefi -- -D warnings
+
+      - name: Build
+        run: cargo build --locked --release --target aarch64-unknown-uefi
+
+      - name: Verify embedded version
+        run: >-
+          strings target/aarch64-unknown-uefi/release/armada-boot.efi
+          | grep --fixed-strings "Bootloader Version: $VERSION"
+
+      - name: Package release
+        shell: bash
+        run: |
+          mkdir dist
+          cp target/aarch64-unknown-uefi/release/armada-boot.efi "dist/armada-boot-$VERSION.efi"
+          cd dist
+          sha256sum "armada-boot-$VERSION.efi" > "armada-boot-$VERSION.efi.sha256"
+
+      - name: Create prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$VERSION"
+          "dist/armada-boot-$VERSION.efi"
+          "dist/armada-boot-$VERSION.efi.sha256"
+          --repo "$GITHUB_REPOSITORY"
+          --target "$GITHUB_SHA"
+          --title "Armada EFI $VERSION"
+          --generate-notes
+          --prerelease
