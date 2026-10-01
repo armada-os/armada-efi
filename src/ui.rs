@@ -489,7 +489,7 @@ pub fn menu(
     }];
     if let Some(version) = rollback {
         items.push(Item {
-            label: "Fallback Version",
+            label: "Rollback Version",
             detail: Some(version),
             back: false,
         });
