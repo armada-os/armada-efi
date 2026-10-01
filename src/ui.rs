@@ -24,7 +24,7 @@ const DEVICE_TREE: uefi::Guid = guid!("b1b621d5-f19c-41a5-830b-d9152c69aae0");
 
 const WHITE: Rgb888 = Rgb888::WHITE;
 const MUTED: Rgb888 = Rgb888::new(0x9a, 0x9a, 0xa0);
-const SELECTED: Rgb888 = Rgb888::new(0x18, 0x18, 0x1a);
+const CARD: Rgb888 = Rgb888::new(0x18, 0x18, 0x1a);
 
 #[derive(Clone, Copy)]
 pub enum Choice {
@@ -70,15 +70,18 @@ struct Canvas {
     width: usize,
     height: usize,
     turns: u8,
+    scale: usize,
 }
 
 impl Canvas {
     fn new(width: usize, height: usize, turns: u8) -> Self {
+        let scale = (height.min(width) / 900).max(1);
         Self {
             pixels: vec![BltPixel::new(0, 0, 0); width * height],
             width,
             height,
             turns: turns % 4,
+            scale,
         }
     }
 
@@ -94,7 +97,10 @@ impl Canvas {
 
 impl OriginDimensions for Canvas {
     fn size(&self) -> Size {
-        let size = Size::new(self.width as u32, self.height as u32);
+        let size = Size::new(
+            (self.width / self.scale) as u32,
+            (self.height / self.scale) as u32,
+        );
         if self.turns % 2 == 1 {
             Size::new(size.height, size.width)
         } else {
@@ -119,13 +125,23 @@ impl DrawTarget for Canvas {
             if x >= size.width as usize || y >= size.height as usize {
                 continue;
             }
-            let (x, y) = match self.turns {
-                1 => (self.width - 1 - y, x),
-                2 => (self.width - 1 - x, self.height - 1 - y),
-                3 => (y, self.height - 1 - x),
+            let (rx, ry) = match self.turns {
+                1 => (self.width / self.scale - 1 - y, x),
+                2 => (
+                    self.width / self.scale - 1 - x,
+                    self.height / self.scale - 1 - y,
+                ),
+                3 => (y, self.height / self.scale - 1 - x),
                 _ => (x, y),
             };
-            self.pixels[y * self.width + x] = BltPixel::new(color.r(), color.g(), color.b());
+            let pixel = BltPixel::new(color.r(), color.g(), color.b());
+            for dy in 0..self.scale {
+                for dx in 0..self.scale {
+                    let px = rx * self.scale + dx;
+                    let py = ry * self.scale + dy;
+                    self.pixels[py * self.width + px] = pixel;
+                }
+            }
         }
         Ok(())
     }
@@ -212,47 +228,101 @@ fn draw_graphics(page: Page, items: &[Item], selected: usize, countdown: Option<
     let (width, height) = output.current_mode_info().resolution();
     let mut canvas = Canvas::new(width, height, rotation(width, height));
     let size = canvas.size();
-    let center = size.width as i32 / 2;
+    let left_center = size.width as i32 / 4;
+    let right_center = size.width as i32 * 3 / 4;
 
     system::with_stdout(|stdout| {
         let _ = stdout.enable_cursor(false);
     });
 
     let logo = Bmp::<Rgb888>::from_slice(LOGO).ok()?;
-    let split = size.width > size.height;
-    let content_top = 40;
-    let content_bottom = size.height as i32 - 130;
-    let brand_height = if page.device.is_some() { 400 } else { 350 };
-    let logo_y = if split {
-        content_top + (content_bottom - content_top - brand_height) / 2
-    } else {
-        size.height as i32 / 18
-    };
-
-    let item = FontRenderer::new::<fonts::u8g2_font_fub30_tr>();
-    let hint = FontRenderer::new::<fonts::u8g2_font_fur17_tr>();
-    let hint_bold = FontRenderer::new::<fonts::u8g2_font_fub17_tr>();
-    let title = FontRenderer::new::<fonts::u8g2_font_fub35_tr>();
-
-    let title_y = logo_y + logo.size().height as i32 + 65;
-    let row_height = if items.iter().any(|item| item.detail.is_some()) {
-        116
-    } else {
-        80
-    };
-    let standard_y = title_y + 93;
-    let brand_center = if split { center / 2 } else { center };
-    let menu_center = if split { center + center / 2 } else { center };
-
-    let logo_x = brand_center - logo.size().width as i32 / 2;
+    let info_box_height = 240;
+    let gap = 54;
+    let total_left_height = logo.size().height as i32
+        + if page.device.is_some() {
+            info_box_height + gap
+        } else {
+            0
+        };
+    let logo_x = left_center - logo.size().width as i32 / 2;
+    let logo_y = (size.height as i32 - total_left_height) / 2;
     Image::new(&logo, Point::new(logo_x, logo_y))
         .draw(&mut canvas)
         .ok()?;
 
+    let item = FontRenderer::new::<fonts::u8g2_font_fub35_tr>();
+    let hint = FontRenderer::new::<fonts::u8g2_font_fur20_tr>();
+    let hint_bold = FontRenderer::new::<fonts::u8g2_font_fub20_tr>();
+    let title = FontRenderer::new::<fonts::u8g2_font_fub42_tr>();
+    let info_label = FontRenderer::new::<fonts::u8g2_font_fub17_tr>();
+    let info_val = FontRenderer::new::<fonts::u8g2_font_fub25_tr>();
+
+    if let Some(device) = page.device {
+        let box_width = (logo.size().width as i32).max(380);
+        let box_x = left_center - box_width / 2;
+        let box_y = logo_y + logo.size().height as i32 + gap;
+        let area = Rectangle::new(
+            Point::new(box_x, box_y),
+            Size::new(box_width as u32, info_box_height as u32),
+        );
+        RoundedRectangle::with_equal_corners(area, Size::new(14, 14))
+            .into_styled(PrimitiveStyle::with_fill(CARD))
+            .draw(&mut canvas)
+            .ok()?;
+
+        let pad_x = box_x + 24;
+        info_label
+            .render(
+                "INFO",
+                Point::new(pad_x, box_y + 32),
+                VerticalPosition::Center,
+                FontColor::Transparent(MUTED),
+                &mut canvas,
+            )
+            .ok()?;
+        info_label
+            .render(
+                "SELECTED DEVICE",
+                Point::new(pad_x, box_y + 76),
+                VerticalPosition::Center,
+                FontColor::Transparent(MUTED),
+                &mut canvas,
+            )
+            .ok()?;
+        info_val
+            .render(
+                device,
+                Point::new(pad_x, box_y + 110),
+                VerticalPosition::Center,
+                FontColor::Transparent(WHITE),
+                &mut canvas,
+            )
+            .ok()?;
+        info_label
+            .render(
+                "EFI BOOTLOADER VERSION",
+                Point::new(pad_x, box_y + 160),
+                VerticalPosition::Center,
+                FontColor::Transparent(MUTED),
+                &mut canvas,
+            )
+            .ok()?;
+        info_val
+            .render(
+                env!("ARMADA_BOOT_VERSION"),
+                Point::new(pad_x, box_y + 196),
+                VerticalPosition::Center,
+                FontColor::Transparent(WHITE),
+                &mut canvas,
+            )
+            .ok()?;
+    }
+
+    let title_y = (size.height as i32 / 8).max(90);
     title
         .render_aligned(
             page.title,
-            Point::new(brand_center, title_y),
+            Point::new(right_center, title_y),
             VerticalPosition::Center,
             HorizontalAlignment::Center,
             FontColor::Transparent(WHITE),
@@ -260,35 +330,34 @@ fn draw_graphics(page: Page, items: &[Item], selected: usize, countdown: Option<
         )
         .ok()?;
 
-    let (mut y, rows) = if split {
-        let rows = ((content_bottom - content_top) / row_height).max(1) as usize;
-        let visible = rows.min(items.len()) as i32;
-        (
-            content_top + (content_bottom - content_top - visible * row_height) / 2,
-            rows,
-        )
+    let row_height = if items.iter().any(|item| item.detail.is_some()) {
+        124
     } else {
-        (
-            standard_y,
-            ((size.height as i32 - standard_y - 170) / row_height).max(1) as usize,
-        )
+        76
     };
-    let column_width = if split { size.width / 2 } else { size.width };
-    let bar = Size::new((column_width * 2 / 3).min(400), row_height as u32);
+    let item_gap = 20;
+    let max_rows = ((size.height as i32 - 250) / (row_height + item_gap)).max(1) as usize;
+    let rows = items.len().min(max_rows);
+    let total_menu_height = rows as i32 * row_height + (rows as i32 - 1).max(0) * item_gap;
+    let mut y = (size.height as i32 - total_menu_height) / 2;
+
+    let bar = Size::new((size.width / 3).min(480), row_height as u32);
     let first = selected
         .saturating_sub(rows / 2)
         .min(items.len().saturating_sub(rows));
     for (index, entry) in items.iter().enumerate().skip(first).take(rows) {
-        let color = if index == selected { WHITE } else { MUTED };
-        if index == selected {
-            let area = Rectangle::new(Point::new(menu_center - bar.width as i32 / 2, y), bar);
+        let is_selected = index == selected;
+        if is_selected {
+            let area = Rectangle::new(Point::new(right_center - bar.width as i32 / 2, y), bar);
             RoundedRectangle::with_equal_corners(area, Size::new(14, 14))
-                .into_styled(PrimitiveStyle::with_fill(SELECTED))
+                .into_styled(PrimitiveStyle::with_fill(WHITE))
                 .draw(&mut canvas)
                 .ok()?;
         }
+        let text_color = if is_selected { Rgb888::BLACK } else { WHITE };
+        let detail_color = if is_selected { Rgb888::BLACK } else { MUTED };
         let label_y = y + if entry.detail.is_some() {
-            40
+            42
         } else {
             row_height / 2
         };
@@ -298,8 +367,8 @@ fn draw_graphics(page: Page, items: &[Item], selected: usize, countdown: Option<
                 .ok()?
                 .advance
                 .x;
-            let start = menu_center - (width + 42) / 2;
-            let style = PrimitiveStyle::with_stroke(color, 4);
+            let start = right_center - (width + 42) / 2;
+            let style = PrimitiveStyle::with_stroke(text_color, 4);
             Line::new(Point::new(start, label_y), Point::new(start + 28, label_y))
                 .into_styled(style)
                 .draw(&mut canvas)
@@ -322,17 +391,17 @@ fn draw_graphics(page: Page, items: &[Item], selected: usize, countdown: Option<
                 entry.label,
                 Point::new(start + 42, label_y),
                 VerticalPosition::Center,
-                FontColor::Transparent(color),
+                FontColor::Transparent(text_color),
                 &mut canvas,
             )
             .ok()?;
         } else {
             item.render_aligned(
                 entry.label,
-                Point::new(menu_center, label_y),
+                Point::new(right_center, label_y),
                 VerticalPosition::Center,
                 HorizontalAlignment::Center,
-                FontColor::Transparent(color),
+                FontColor::Transparent(text_color),
                 &mut canvas,
             )
             .ok()?;
@@ -340,46 +409,16 @@ fn draw_graphics(page: Page, items: &[Item], selected: usize, countdown: Option<
         if let Some(detail) = entry.detail {
             hint.render_aligned(
                 detail,
-                Point::new(menu_center, y + 88),
+                Point::new(right_center, y + 90),
                 VerticalPosition::Center,
                 HorizontalAlignment::Center,
-                FontColor::Transparent(MUTED),
+                FontColor::Transparent(detail_color),
                 &mut canvas,
             )
             .ok()?;
         }
-        y += row_height;
+        y += row_height + item_gap;
     }
-
-    let (device_y, version_y) = if split {
-        (title_y + 85, title_y + 118)
-    } else {
-        (size.height as i32 - 232, size.height as i32 - 199)
-    };
-    if let Some(device) = page.device {
-        render_pair(
-            &mut canvas,
-            &hint_bold,
-            &hint,
-            brand_center,
-            device_y,
-            "Selected Device: ",
-            device,
-        )?;
-    }
-    render_pair(
-        &mut canvas,
-        &hint_bold,
-        &hint,
-        brand_center,
-        if page.device.is_some() {
-            version_y
-        } else {
-            device_y
-        },
-        "EFI Bootloader Version: ",
-        env!("ARMADA_BOOT_VERSION"),
-    )?;
 
     let countdown = match countdown {
         Some(3) => Some("Booting in 3"),
@@ -390,7 +429,7 @@ fn draw_graphics(page: Page, items: &[Item], selected: usize, countdown: Option<
     if let Some(countdown) = countdown {
         hint.render_aligned(
             countdown,
-            Point::new(brand_center, size.height as i32 - 145),
+            Point::new(right_center, size.height as i32 - 145),
             VerticalPosition::Center,
             HorizontalAlignment::Center,
             FontColor::Transparent(MUTED),
@@ -403,8 +442,8 @@ fn draw_graphics(page: Page, items: &[Item], selected: usize, countdown: Option<
         &mut canvas,
         &hint_bold,
         &hint,
-        center,
-        size.height as i32 - 105,
+        right_center,
+        size.height as i32 - 110,
         "VOL+ / VOL- or Arrows",
         " to select",
     )?;
@@ -413,8 +452,8 @@ fn draw_graphics(page: Page, items: &[Item], selected: usize, countdown: Option<
             &mut canvas,
             &hint_bold,
             &hint,
-            center,
-            size.height as i32 - 72,
+            right_center,
+            size.height as i32 - 75,
             "Power or Enter",
             " to confirm",
         )?;
