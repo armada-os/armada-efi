@@ -51,7 +51,12 @@ fn load(path: &CStr16) -> Result<Handle> {
 }
 
 fn select(entry: &str) -> Result {
-    let entry = CString16::try_from(entry).map_err(|_| Status::INVALID_PARAMETER)?;
+    let entry = if entry.ends_with(".conf") {
+        CString16::try_from(entry)
+    } else {
+        CString16::try_from(alloc::format!("{entry}.conf").as_str())
+    }
+    .map_err(|_| Status::INVALID_PARAMETER)?;
     runtime::set_variable(
         cstr16!("LoaderEntryOneShot"),
         &SYSTEMD,
