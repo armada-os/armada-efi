@@ -1,5 +1,6 @@
 use alloc::string::{String, ToString};
 use alloc::vec;
+use alloc::vec::Vec;
 use core::str;
 use uefi::boot::{self, image_handle};
 use uefi::proto::media::file::{File, FileAttribute, FileInfo, FileMode};
@@ -9,6 +10,7 @@ use uefi::{Result, Status, cstr16};
 pub struct Config {
     pub version: Option<String>,
     pub rollback: Option<Rollback>,
+    pub rotations: Vec<(String, u8)>,
 }
 
 pub struct Rollback {
@@ -54,5 +56,21 @@ pub fn load() -> Result<Config> {
     Ok(Config {
         version: value("ARMADA_DEFAULT_VERSION").map(ToString::to_string),
         rollback,
+        rotations: text
+            .lines()
+            .filter_map(|line| {
+                let (model, degrees) = line
+                    .strip_prefix("ARMADA_EFI_ROTATION=")?
+                    .rsplit_once(':')?;
+                let turns = match degrees {
+                    "0" => 0,
+                    "90" => 1,
+                    "180" => 2,
+                    "270" => 3,
+                    _ => return None,
+                };
+                Some((model.to_string(), turns))
+            })
+            .collect(),
     })
 }

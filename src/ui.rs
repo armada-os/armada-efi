@@ -13,11 +13,15 @@ use fdt::Fdt;
 use tinybmp::Bmp;
 use u8g2_fonts::types::{FontColor, HorizontalAlignment, VerticalPosition};
 use u8g2_fonts::{FontRenderer, fonts};
-use uefi::boot::{self, OpenProtocolAttributes, OpenProtocolParams, image_handle};
+use uefi::boot::{
+    self, EventType, OpenProtocolAttributes, OpenProtocolParams, TimerTrigger, Tpl, image_handle,
+};
 use uefi::proto::ProtocolPointer;
 use uefi::proto::console::gop::{BltOp, BltPixel, BltRegion, GraphicsOutput};
 use uefi::proto::console::text::{Color, Key, ScanCode};
 use uefi::{Handle, Result, guid, system};
+
+use crate::config::Config;
 
 const LOGO: &[u8] = include_bytes!("../assets/armada.bmp");
 const DEVICE_TREE: uefi::Guid = guid!("b1b621d5-f19c-41a5-830b-d9152c69aae0");
@@ -60,6 +64,7 @@ impl<'a> Item<'a> {
 
 #[derive(Clone, Copy)]
 struct Page<'a> {
+    config: &'a Config,
     title: &'a str,
     device: Option<&'a str>,
     confirm_hint: bool,
@@ -160,14 +165,21 @@ fn open<P: ProtocolPointer + ?Sized>(handle: Handle) -> Result<boot::ScopedProto
     }
 }
 
-fn rotation(width: usize, height: usize) -> u8 {
-    device_tree_rotation().unwrap_or_else(|| u8::from(height > width))
+fn rotation(width: usize, height: usize, config: &Config) -> u8 {
+    device_tree_rotation(config).unwrap_or_else(|| u8::from(height > width))
 }
 
-fn device_tree_rotation() -> Option<u8> {
+fn device_tree_rotation(config: &Config) -> Option<u8> {
     system::with_config_table(|tables| {
         let table = tables.iter().find(|table| table.guid == DEVICE_TREE)?;
         let tree = unsafe { Fdt::from_ptr(table.address.cast()) }.ok()?;
+        if let Some((_, turns)) = config
+            .rotations
+            .iter()
+            .find(|(model, _)| model == tree.root().model())
+        {
+            return Some(*turns);
+        }
         let degrees = tree
             .all_nodes()
             .filter(|node| node.name.split('@').next() == Some("panel"))
@@ -226,7 +238,7 @@ fn draw_graphics(page: Page, items: &[Item], selected: usize, countdown: Option<
     let handle = boot::get_handle_for_protocol::<GraphicsOutput>().ok()?;
     let mut output = open::<GraphicsOutput>(handle).ok()?;
     let (width, height) = output.current_mode_info().resolution();
-    let mut canvas = Canvas::new(width, height, rotation(width, height));
+    let mut canvas = Canvas::new(width, height, rotation(width, height, page.config));
     let size = canvas.size();
     let left_center = size.width as i32 / 4;
     let right_center = size.width as i32 * 3 / 4;
@@ -501,71 +513,133 @@ fn draw(page: Page, items: &[Item], selected: usize, countdown: Option<u8>) {
     }
 }
 
-fn wait_for_release() {
-    let mut idle = 0;
-    for _ in 0..50 {
-        let pressed = system::with_stdin(|stdin| stdin.read_key().ok().flatten().is_some());
-        idle = if pressed { 0 } else { idle + 1 };
-        if idle == 3 {
-            return;
+fn keys_down() -> Vec<Key> {
+    system::with_stdin(|stdin| {
+        let mut down = Vec::new();
+        while let Ok(Some(key)) = stdin.read_key() {
+            down.push(key);
         }
-        boot::stall(Duration::from_millis(100));
-    }
+        let _ = stdin.reset(false);
+        boot::stall(Duration::from_millis(2));
+        while let Ok(Some(key)) = stdin.read_key() {
+            down.push(key);
+        }
+        down.dedup();
+        down
+    })
 }
 
 fn choose(page: Page, items: &[Item], timed: bool) -> usize {
+    let timer = || {
+        unsafe { boot::create_event(EventType::TIMER, Tpl::APPLICATION, None, None) }
+            .expect("No timer event")
+    };
+    let (repeat, probe, countdown) = (timer(), timer(), timer());
+    let mut held = keys_down();
+    if !held.is_empty() {
+        let _ = boot::set_timer(&probe, TimerTrigger::Periodic(Duration::from_millis(25)));
+    }
+    let mut timeout = timed.then_some(3u8);
+    if timed {
+        let _ = boot::set_timer(&countdown, TimerTrigger::Periodic(Duration::from_secs(1)));
+    }
     let mut selected = 0;
-    system::with_stdin(|stdin| {
-        let _ = stdin.reset(false);
-    });
-    draw(page, items, selected, timed.then_some(3));
+    let mut last = None;
+    let mut redraw = true;
 
-    let mut timeout = timed.then_some(60u8);
-    loop {
-        let key = system::with_stdin(|stdin| stdin.read_key().ok().flatten());
-        match key {
-            Some(Key::Special(ScanCode::UP)) => {
-                timeout = None;
-                selected = selected.checked_sub(1).unwrap_or(items.len() - 1);
-                draw(page, items, selected, None);
-                boot::stall(Duration::from_millis(250));
+    'menu: loop {
+        if redraw {
+            draw(page, items, selected, timeout);
+        }
+        redraw = false;
+        let (index, key) = system::with_stdin(|stdin| {
+            let events = unsafe {
+                [
+                    stdin.wait_for_key_event().expect("No key event"),
+                    repeat.unsafe_clone(),
+                    probe.unsafe_clone(),
+                    countdown.unsafe_clone(),
+                ]
+            };
+            match boot::wait_for_event(&events).unwrap_or(0) {
+                0 => (0, stdin.read_key().ok().flatten()),
+                index => (index, None),
             }
-            Some(Key::Special(ScanCode::DOWN)) => {
-                timeout = None;
-                selected = (selected + 1) % items.len();
-                draw(page, items, selected, None);
-                boot::stall(Duration::from_millis(250));
+        });
+        let mut keys = Vec::new();
+        match index {
+            0 => {
+                if let Some(key) = key
+                    && !held.contains(&key)
+                {
+                    held.push(key);
+                    keys.push(key);
+                }
             }
-            Some(Key::Special(ScanCode::SUSPEND)) => break,
-            Some(Key::Printable(key)) if key == '\r' => break,
+            1 => {
+                if let Some(key @ Key::Special(ScanCode::UP | ScanCode::DOWN)) = last {
+                    let _ = boot::set_timer(
+                        &repeat,
+                        TimerTrigger::Relative(Duration::from_millis(100)),
+                    );
+                    keys.push(key);
+                }
+            }
+            2 => {
+                let down = keys_down();
+                keys.extend(down.iter().filter(|key| !held.contains(key)));
+                held = down;
+                if last.is_some_and(|key| !held.contains(&key)) {
+                    last = None;
+                    let _ = boot::set_timer(&repeat, TimerTrigger::Cancel);
+                }
+                if held.is_empty() {
+                    let _ = boot::set_timer(&probe, TimerTrigger::Cancel);
+                }
+            }
             _ => {
-                if let Some(polls) = timeout.as_mut() {
-                    *polls -= 1;
-                    if *polls == 0 {
+                if let Some(seconds) = timeout.as_mut() {
+                    *seconds -= 1;
+                    if *seconds == 0 {
                         break;
                     }
-                    if *polls % 20 == 0 {
-                        draw(page, items, selected, Some(*polls / 20));
-                    }
+                    redraw = true;
                 }
-                boot::stall(Duration::from_millis(50));
             }
+        }
+        for key in keys {
+            if index != 1 {
+                last = Some(key);
+                let _ =
+                    boot::set_timer(&repeat, TimerTrigger::Relative(Duration::from_millis(300)));
+                let _ = boot::set_timer(&probe, TimerTrigger::Periodic(Duration::from_millis(25)));
+            }
+            match key {
+                Key::Special(ScanCode::UP) => {
+                    selected = selected.checked_sub(1).unwrap_or(items.len() - 1);
+                }
+                Key::Special(ScanCode::DOWN) => selected = (selected + 1) % items.len(),
+                Key::Special(ScanCode::SUSPEND) => break 'menu,
+                Key::Printable(key) if key == '\r' => break 'menu,
+                _ => continue,
+            }
+            timeout = None;
+            let _ = boot::set_timer(&countdown, TimerTrigger::Cancel);
+            redraw = true;
         }
     }
 
-    wait_for_release();
+    let _ = boot::close_event(repeat);
+    let _ = boot::close_event(probe);
+    let _ = boot::close_event(countdown);
+    system::with_stdin(|stdin| while let Ok(Some(_)) = stdin.read_key() {});
     selected
 }
 
-pub fn menu(
-    version: Option<&str>,
-    rollback: Option<&str>,
-    device: Option<&str>,
-    timed: bool,
-) -> Choice {
+pub fn menu(config: &Config, rollback: Option<&str>, device: Option<&str>, timed: bool) -> Choice {
     let mut items = vec![Item {
         label: "ArmadaOS",
-        detail: version,
+        detail: config.version.as_deref(),
         back: false,
     }];
     if let Some(version) = rollback {
@@ -581,6 +655,7 @@ pub fn menu(
         back: false,
     });
     let page = Page {
+        config,
         title: "Main Menu",
         device: Some(device.unwrap_or("Unknown")),
         confirm_hint: true,
@@ -592,7 +667,12 @@ pub fn menu(
     }
 }
 
-pub fn device_menu(models: &[&str], current: Option<&str>, cancellable: bool) -> Option<usize> {
+pub fn device_menu(
+    config: &Config,
+    models: &[&str],
+    current: Option<&str>,
+    cancellable: bool,
+) -> Option<usize> {
     let mut manufacturers = Vec::new();
     for (index, model) in models.iter().enumerate() {
         let manufacturer = model.split_once(' ').map_or(*model, |(name, _)| name);
@@ -611,6 +691,7 @@ pub fn device_menu(models: &[&str], current: Option<&str>, cancellable: bool) ->
             items.push(Item::back());
         }
         let page = Page {
+            config,
             title: "Select Device",
             device: current,
             confirm_hint: true,

@@ -74,13 +74,14 @@ fn persisted_device(trees: &[dtb::DeviceTree]) -> Option<usize> {
 }
 
 fn choose_device(
+    config: &config::Config,
     trees: &[dtb::DeviceTree],
     current: Option<usize>,
     cancellable: bool,
 ) -> Result<Option<usize>> {
     let models: Vec<_> = trees.iter().map(|tree| tree.model.as_str()).collect();
     let current = current.map(|index| trees[index].model.as_str());
-    let Some(selected) = ui::device_menu(&models, current, cancellable) else {
+    let Some(selected) = ui::device_menu(config, &models, current, cancellable) else {
         return Ok(None);
     };
     dtb::install(&trees[selected])?;
@@ -112,7 +113,7 @@ fn run() -> Result {
         device = dtb::detected(&trees);
     }
     while device.is_none() {
-        device = choose_device(&trees, device, false)?;
+        device = choose_device(&config, &trees, device, false)?;
     }
     let mut timed = true;
     loop {
@@ -121,7 +122,7 @@ fn run() -> Result {
             Some((rollback, tree))
         });
         match ui::menu(
-            config.version.as_deref(),
+            &config,
             rollback
                 .as_ref()
                 .map(|(rollback, _)| rollback.version.as_str()),
@@ -136,7 +137,7 @@ fn run() -> Result {
                 break;
             }
             Choice::Device => {
-                if let Some(selected) = choose_device(&trees, device, true)? {
+                if let Some(selected) = choose_device(&config, &trees, device, true)? {
                     device = Some(selected);
                 }
                 timed = false;
