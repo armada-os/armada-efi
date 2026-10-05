@@ -21,6 +21,8 @@ use uefi::proto::console::gop::{BltOp, BltPixel, BltRegion, GraphicsOutput};
 use uefi::proto::console::text::{Color, Key, ScanCode};
 use uefi::{Handle, Result, guid, system};
 
+use crate::config::Config;
+
 const LOGO: &[u8] = include_bytes!("../assets/armada.bmp");
 const DEVICE_TREE: uefi::Guid = guid!("b1b621d5-f19c-41a5-830b-d9152c69aae0");
 
@@ -62,6 +64,7 @@ impl<'a> Item<'a> {
 
 #[derive(Clone, Copy)]
 struct Page<'a> {
+    config: &'a Config,
     title: &'a str,
     device: Option<&'a str>,
     confirm_hint: bool,
@@ -162,14 +165,21 @@ fn open<P: ProtocolPointer + ?Sized>(handle: Handle) -> Result<boot::ScopedProto
     }
 }
 
-fn rotation(width: usize, height: usize) -> u8 {
-    device_tree_rotation().unwrap_or_else(|| u8::from(height > width))
+fn rotation(width: usize, height: usize, config: &Config) -> u8 {
+    device_tree_rotation(config).unwrap_or_else(|| u8::from(height > width))
 }
 
-fn device_tree_rotation() -> Option<u8> {
+fn device_tree_rotation(config: &Config) -> Option<u8> {
     system::with_config_table(|tables| {
         let table = tables.iter().find(|table| table.guid == DEVICE_TREE)?;
         let tree = unsafe { Fdt::from_ptr(table.address.cast()) }.ok()?;
+        if let Some((_, turns)) = config
+            .rotations
+            .iter()
+            .find(|(model, _)| model == tree.root().model())
+        {
+            return Some(*turns);
+        }
         let degrees = tree
             .all_nodes()
             .filter(|node| node.name.split('@').next() == Some("panel"))
@@ -228,7 +238,7 @@ fn draw_graphics(page: Page, items: &[Item], selected: usize, countdown: Option<
     let handle = boot::get_handle_for_protocol::<GraphicsOutput>().ok()?;
     let mut output = open::<GraphicsOutput>(handle).ok()?;
     let (width, height) = output.current_mode_info().resolution();
-    let mut canvas = Canvas::new(width, height, rotation(width, height));
+    let mut canvas = Canvas::new(width, height, rotation(width, height, page.config));
     let size = canvas.size();
     let left_center = size.width as i32 / 4;
     let right_center = size.width as i32 * 3 / 4;
@@ -626,15 +636,10 @@ fn choose(page: Page, items: &[Item], timed: bool) -> usize {
     selected
 }
 
-pub fn menu(
-    version: Option<&str>,
-    rollback: Option<&str>,
-    device: Option<&str>,
-    timed: bool,
-) -> Choice {
+pub fn menu(config: &Config, rollback: Option<&str>, device: Option<&str>, timed: bool) -> Choice {
     let mut items = vec![Item {
         label: "ArmadaOS",
-        detail: version,
+        detail: config.version.as_deref(),
         back: false,
     }];
     if let Some(version) = rollback {
@@ -650,6 +655,7 @@ pub fn menu(
         back: false,
     });
     let page = Page {
+        config,
         title: "Main Menu",
         device: Some(device.unwrap_or("Unknown")),
         confirm_hint: true,
@@ -661,7 +667,12 @@ pub fn menu(
     }
 }
 
-pub fn device_menu(models: &[&str], current: Option<&str>, cancellable: bool) -> Option<usize> {
+pub fn device_menu(
+    config: &Config,
+    models: &[&str],
+    current: Option<&str>,
+    cancellable: bool,
+) -> Option<usize> {
     let mut manufacturers = Vec::new();
     for (index, model) in models.iter().enumerate() {
         let manufacturer = model.split_once(' ').map_or(*model, |(name, _)| name);
@@ -680,6 +691,7 @@ pub fn device_menu(models: &[&str], current: Option<&str>, cancellable: bool) ->
             items.push(Item::back());
         }
         let page = Page {
+            config,
             title: "Select Device",
             device: current,
             confirm_hint: true,
