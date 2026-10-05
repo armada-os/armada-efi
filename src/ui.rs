@@ -13,7 +13,9 @@ use fdt::Fdt;
 use tinybmp::Bmp;
 use u8g2_fonts::types::{FontColor, HorizontalAlignment, VerticalPosition};
 use u8g2_fonts::{FontRenderer, fonts};
-use uefi::boot::{self, OpenProtocolAttributes, OpenProtocolParams, image_handle};
+use uefi::boot::{
+    self, EventType, OpenProtocolAttributes, OpenProtocolParams, TimerTrigger, Tpl, image_handle,
+};
 use uefi::proto::ProtocolPointer;
 use uefi::proto::console::gop::{BltOp, BltPixel, BltRegion, GraphicsOutput};
 use uefi::proto::console::text::{Color, Key, ScanCode};
@@ -501,59 +503,126 @@ fn draw(page: Page, items: &[Item], selected: usize, countdown: Option<u8>) {
     }
 }
 
-fn wait_for_release() {
-    let mut idle = 0;
-    for _ in 0..50 {
-        let pressed = system::with_stdin(|stdin| stdin.read_key().ok().flatten().is_some());
-        idle = if pressed { 0 } else { idle + 1 };
-        if idle == 3 {
-            return;
+fn keys_down() -> Vec<Key> {
+    system::with_stdin(|stdin| {
+        let mut down = Vec::new();
+        while let Ok(Some(key)) = stdin.read_key() {
+            down.push(key);
         }
-        boot::stall(Duration::from_millis(100));
-    }
+        let _ = stdin.reset(false);
+        boot::stall(Duration::from_millis(2));
+        while let Ok(Some(key)) = stdin.read_key() {
+            down.push(key);
+        }
+        down.dedup();
+        down
+    })
 }
 
 fn choose(page: Page, items: &[Item], timed: bool) -> usize {
+    let timer = || {
+        unsafe { boot::create_event(EventType::TIMER, Tpl::APPLICATION, None, None) }
+            .expect("No timer event")
+    };
+    let (repeat, probe, countdown) = (timer(), timer(), timer());
+    let mut held = keys_down();
+    if !held.is_empty() {
+        let _ = boot::set_timer(&probe, TimerTrigger::Periodic(Duration::from_millis(25)));
+    }
+    let mut timeout = timed.then_some(3u8);
+    if timed {
+        let _ = boot::set_timer(&countdown, TimerTrigger::Periodic(Duration::from_secs(1)));
+    }
     let mut selected = 0;
-    system::with_stdin(|stdin| {
-        let _ = stdin.reset(false);
-    });
-    draw(page, items, selected, timed.then_some(3));
+    let mut last = None;
+    let mut redraw = true;
 
-    let mut timeout = timed.then_some(60u8);
-    loop {
-        let key = system::with_stdin(|stdin| stdin.read_key().ok().flatten());
-        match key {
-            Some(Key::Special(ScanCode::UP)) => {
-                timeout = None;
-                selected = selected.checked_sub(1).unwrap_or(items.len() - 1);
-                draw(page, items, selected, None);
-                boot::stall(Duration::from_millis(250));
+    'menu: loop {
+        if redraw {
+            draw(page, items, selected, timeout);
+        }
+        redraw = false;
+        let (index, key) = system::with_stdin(|stdin| {
+            let events = unsafe {
+                [
+                    stdin.wait_for_key_event().expect("No key event"),
+                    repeat.unsafe_clone(),
+                    probe.unsafe_clone(),
+                    countdown.unsafe_clone(),
+                ]
+            };
+            match boot::wait_for_event(&events).unwrap_or(0) {
+                0 => (0, stdin.read_key().ok().flatten()),
+                index => (index, None),
             }
-            Some(Key::Special(ScanCode::DOWN)) => {
-                timeout = None;
-                selected = (selected + 1) % items.len();
-                draw(page, items, selected, None);
-                boot::stall(Duration::from_millis(250));
+        });
+        let mut keys = Vec::new();
+        match index {
+            0 => {
+                if let Some(key) = key
+                    && !held.contains(&key)
+                {
+                    held.push(key);
+                    keys.push(key);
+                }
             }
-            Some(Key::Special(ScanCode::SUSPEND)) => break,
-            Some(Key::Printable(key)) if key == '\r' => break,
+            1 => {
+                if let Some(key @ Key::Special(ScanCode::UP | ScanCode::DOWN)) = last {
+                    let _ = boot::set_timer(
+                        &repeat,
+                        TimerTrigger::Relative(Duration::from_millis(100)),
+                    );
+                    keys.push(key);
+                }
+            }
+            2 => {
+                let down = keys_down();
+                keys.extend(down.iter().filter(|key| !held.contains(key)));
+                held = down;
+                if last.is_some_and(|key| !held.contains(&key)) {
+                    last = None;
+                    let _ = boot::set_timer(&repeat, TimerTrigger::Cancel);
+                }
+                if held.is_empty() {
+                    let _ = boot::set_timer(&probe, TimerTrigger::Cancel);
+                }
+            }
             _ => {
-                if let Some(polls) = timeout.as_mut() {
-                    *polls -= 1;
-                    if *polls == 0 {
+                if let Some(seconds) = timeout.as_mut() {
+                    *seconds -= 1;
+                    if *seconds == 0 {
                         break;
                     }
-                    if *polls % 20 == 0 {
-                        draw(page, items, selected, Some(*polls / 20));
-                    }
+                    redraw = true;
                 }
-                boot::stall(Duration::from_millis(50));
             }
+        }
+        for key in keys {
+            if index != 1 {
+                last = Some(key);
+                let _ =
+                    boot::set_timer(&repeat, TimerTrigger::Relative(Duration::from_millis(300)));
+                let _ = boot::set_timer(&probe, TimerTrigger::Periodic(Duration::from_millis(25)));
+            }
+            match key {
+                Key::Special(ScanCode::UP) => {
+                    selected = selected.checked_sub(1).unwrap_or(items.len() - 1);
+                }
+                Key::Special(ScanCode::DOWN) => selected = (selected + 1) % items.len(),
+                Key::Special(ScanCode::SUSPEND) => break 'menu,
+                Key::Printable(key) if key == '\r' => break 'menu,
+                _ => continue,
+            }
+            timeout = None;
+            let _ = boot::set_timer(&countdown, TimerTrigger::Cancel);
+            redraw = true;
         }
     }
 
-    wait_for_release();
+    let _ = boot::close_event(repeat);
+    let _ = boot::close_event(probe);
+    let _ = boot::close_event(countdown);
+    system::with_stdin(|stdin| while let Ok(Some(_)) = stdin.read_key() {});
     selected
 }
 
